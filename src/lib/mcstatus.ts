@@ -1,0 +1,78 @@
+export type ServerStatus = {
+  online: boolean;
+  version?: string | undefined;
+  playersOnline: number;
+  playersMax: number;
+  players: string[];
+};
+
+const OFFLINE: ServerStatus = { online: false, playersOnline: 0, playersMax: 0, players: [] };
+
+/** Strip Geyser/Floodgate prefixes like "*" or "." for avatar lookups. */
+export function cleanName(name: string): string {
+  return name.trim().replace(/^[*.!~_-]+/, "");
+}
+
+type Raw = {
+  online?: boolean;
+  version?: string | { name?: string; name_clean?: string };
+  players?: {
+    online?: number; max?: number;
+    list?: (string | { name?: string; name_clean?: string; name_raw?: string })[];
+    sample?: (string | { name?: string; name_clean?: string })[];
+  };
+};
+
+export function normalize(raw: Raw | null | undefined): ServerStatus {
+  if (!raw || !raw.online) return OFFLINE;
+  const arr = [...(raw.players?.list ?? []), ...(raw.players?.sample ?? [])];
+  const names = arr
+    .map((p) => (typeof p === "string" ? p : p.name_clean ?? p.name ?? ""))
+    .map((n) => n.replace(/§./g, "").trim())
+    .filter(Boolean);
+  const version = typeof raw.version === "string" ? raw.version : raw.version?.name_clean ?? raw.version?.name;
+  return {
+    online: true,
+    version,
+    playersOnline: raw.players?.online ?? names.length,
+    playersMax: raw.players?.max ?? 0,
+    players: [...new Set(names)],
+  };
+}
+
+/** Merge results: prefer a source with a player list, keep the highest count. */
+export function merge(results: ServerStatus[]): ServerStatus {
+  const online = results.filter((r) => r.online);
+  if (!online.length) return OFFLINE;
+  const withList = online.find((r) => r.players.length > 0);
+  const base = (withList ?? online[0])!;
+  return {
+    ...base,
+    version: online.map((r) => r.version).find(Boolean),
+    playersOnline: Math.max(...online.map((r) => r.playersOnline), base.players.length),
+    playersMax: Math.max(...online.map((r) => r.playersMax)),
+  };
+}
+
+async function get(url: string): Promise<ServerStatus> {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return OFFLINE;
+    return normalize(await r.json());
+  } catch {
+    return OFFLINE;
+  }
+}
+
+export async function fetchServerStatus(address: string): Promise<ServerStatus> {
+  // Ambil data dari 4 jalur API sekaligus (Bedrock & Java, mcsrvstat & mcstatus.io)
+  // Karena server Geyser, endpoint Java mcstatus.io sangat penting untuk membaca list player secara akurat.
+  const [mcsrvBedrock, mcsrvJava, mcstatusBedrock, mcstatusJava] = await Promise.all([
+    get(`https://api.mcsrvstat.us/bedrock/3/${address}`),
+    get(`https://api.mcsrvstat.us/3/${address}`),
+    get(`https://api.mcstatus.io/v2/status/bedrock/${address}`),
+    get(`https://api.mcstatus.io/v2/status/java/${address}`),
+  ]);
+
+  return merge([mcsrvBedrock, mcsrvJava, mcstatusBedrock, mcstatusJava]);
+}
